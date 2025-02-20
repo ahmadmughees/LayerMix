@@ -7,6 +7,7 @@
 ---
 <img src="images/LayerMix_samples.png" alt="Samples" width="540" align="middle"/>
 ---
+
 ## Latest Updates
 - **2025-01-08**: LayerMix paper is released on [ArXiv ](https://arxiv.org/abs/2501.04861).
 
@@ -104,7 +105,7 @@ If you find this useful in your research, please consider citing:
       url={https://arxiv.org/abs/2501.04861}, 
 }
 ```
-## ❤️ Acknowledgment
+## Acknowledgment
 We would like to thank the following codebases for their amazing work.  
 
 * https://github.com/google-research/augmix
