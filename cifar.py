@@ -10,9 +10,10 @@ from typing import Any
 
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from torch.amp import GradScaler
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 from torchvision import datasets, transforms
 
 from data import MixerDataset
@@ -75,6 +76,16 @@ IMAGE_SIZE = 32
 scaler = GradScaler()
 
 
+def set_seed(seed: int) -> None:
+    """Set random seed for reproducibility."""
+    print(f"using {seed} as default seed")
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
 def write_to_json(data: dict[str, Any], file_path: str):
     existing_data = {}
     if os.path.exists(file_path):
@@ -88,11 +99,16 @@ def write_to_json(data: dict[str, Any], file_path: str):
         json.dump(existing_data, f, indent=4)
 
 
-def train_one_epoch(net, train_loader, optimizer, scheduler):
+def train_one_epoch(
+        net: nn.Module,
+        train_loader: DataLoader,
+        optimizer: torch.optim.Optimizer,
+        scheduler: torch.optim.lr_scheduler
+) -> float:
     """Train for one epoch."""
     net.train()
     loss_ema = 0.
-    for i, (images, targets) in enumerate(train_loader):
+    for images, targets in train_loader:
         optimizer.zero_grad(set_to_none=True)
 
         if not args.jsd:
@@ -129,16 +145,100 @@ def train_one_epoch(net, train_loader, optimizer, scheduler):
     return loss_ema
 
 
+def run_full_evaluate(
+        net: nn.Module,
+        test_loader: DataLoader,
+        test_data: Dataset,
+        paths: dict,
+        num_classes: int,
+        seed: int
+) -> None:
+
+    evaluate_pgd = True
+    evaluate_rms = True
+    evaluate_c = True
+    evaluate_c_bar = True
+    evaluate_p = False
+
+    results = dict()
+    results["seed"] = seed
+
+    start = time.time()
+    # Evaluate clean accuracy first because test_c mutates underlying data
+    net.eval()
+    ctx = test(net, test_loader)
+
+    results["test_loss"] = ctx.loss
+    results["test_acc"] = ctx.acc
+    results["test_error"] = 100 - 100. * ctx.acc
+
+    if evaluate_rms:
+        rms = calib_err(ctx.confidence, ctx.correct, p="2")
+        aurra_value = aurra(ctx.confidence, ctx.correct)
+        results["rms"] = rms
+        results["aurra"] = aurra_value
+
+    # test on adversarial data
+    if evaluate_pgd:
+        adversary = PGD(epsilon=2. / 255, num_steps=20, step_size=0.5 / 255).cuda()
+        adv_ctx = test(net, test_loader, adv=adversary)
+        results["adv_test_loss"] = adv_ctx.loss
+        results["adv_test_acc"] = adv_ctx.acc
+        results["adv_test_error"] = 100 - 100. * adv_ctx.acc
+
+    # test on corrupted data
+    if evaluate_c:
+        test_c_ctx = test_c(
+            net, test_data, paths.get("c_path"),
+            eval_batch_size=args.eval_batch_size,
+            workers=args.num_workers,
+            save_path=args.save
+        )
+        results["c_acc"] = test_c_ctx.acc
+        results["c_error"] = 100 - 100. * test_c_ctx.acc
+        results["c_rms"] = test_c_ctx.rms
+
+    # test on c bar
+    if evaluate_c_bar:
+        test_c_bar_ctx = test_c(
+            net, test_data, paths.get("c_bar_path"),
+            eval_batch_size=args.eval_batch_size,
+            workers=args.num_workers,
+            save_path=args.save)
+        results["c_bar_acc"] = test_c_bar_ctx.acc
+        results["c_bar_error"] = 100 - 100. * test_c_bar_ctx.acc
+        results["c_bar_rms"] = test_c_bar_ctx.rms
+        if evaluate_c:
+            results["mce_c_and_c_bar"] = 100 - 100. * (15 * test_c_ctx.acc + 10 * test_c_bar_ctx.acc) / 25
+
+    # test on perturbed data
+    if evaluate_p:
+        flip_list, top5_list = test_p(net=net, path=paths.get("p_path"), num_classes=num_classes,
+                                      save_path=os.path.join(args.save, "perturbation_results.csv"))
+        results["mean_flipping_prob"] = np.mean(flip_list)
+        results["mean_top5_distance"] = np.mean(top5_list)
+
+    write_to_json(results, os.path.join(args.save, f"all_results.json"))
+
+    print(f"evaluation finished in {time.time() - start / 60:.2f} minutes.")
+    print("The results are: ")
+    for key, value in results.items():
+        print(f"{key} : {value}")
+    return
+
+
+def get_lr(step: int, total_steps: int, lr_max: float, lr_min: float, warmup_steps: int) -> float:
+    """Compute learning rate with linear warmup and cosine annealing."""
+    if step < warmup_steps:
+        return lr_min + (lr_max - lr_min) * (step / warmup_steps)
+    else:  # cosine annealing
+        return lr_min + (lr_max - lr_min) * 0.5 * (
+                    1 + np.cos((step - warmup_steps) / (total_steps - warmup_steps) * np.pi))
+
+
 def main():
     SEED = args.seed if args.seed>0 else random.randint(1, 1000)
-    print(f"using {SEED} as default seed")
-
-    torch.manual_seed(SEED)
-    np.random.seed(SEED)
-    random.seed(SEED)
-    torch.cuda.manual_seed(SEED)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+    set_seed(SEED)
 
     normalize = transforms.Normalize([0.5] * 3, [0.5] * 3)
     to_tensor_norm = transforms.Compose([transforms.ToTensor(), normalize])
@@ -148,22 +248,40 @@ def main():
         transforms.RandomCrop(IMAGE_SIZE, padding=4)])
 
     if args.dataset == "cifar10":
-        train_data = datasets.CIFAR10(os.path.join(args.data_path, "cifar"),
-                                      train=True, transform=train_transform, download=True)
-        test_data = datasets.CIFAR10(os.path.join(args.data_path, "cifar"),
-                                     train=False, transform=to_tensor_norm, download=True)
-        base_c_path = os.path.join(args.data_path, "cifar/CIFAR-10-C/")
-        base_c_bar_path = os.path.join(args.data_path, "cifar/CIFAR-10-C-Bar/")
-        base_p_path = os.path.join(args.data_path, "cifar/CIFAR-10-P/")
+        train_data = datasets.CIFAR10(
+            args.data_path,
+            train=True,
+            transform=train_transform,
+            download=True
+        )
+        test_data = datasets.CIFAR10(
+            args.data_path,
+            train=False,
+            transform=to_tensor_norm,
+            download=True
+        )
+        paths = {
+            "c_path": os.path.join(args.data_path, "CIFAR-10-C/"),
+            "c_bar_path" : os.path.join(args.data_path, "CIFAR-10-C-Bar/"),
+            "p_path": os.path.join(args.data_path, "CIFAR-10-P/"),
+        }
         num_classes = 10
     else:
         train_data = datasets.CIFAR100(
-            os.path.join(args.data_path, "cifar"), train=True, transform=train_transform, download=True)
+            args.data_path,
+            train=True,
+            transform=train_transform,
+            download=True)
         test_data = datasets.CIFAR100(
-            os.path.join(args.data_path, "cifar"), train=False, transform=to_tensor_norm, download=True)
-        base_c_path = os.path.join(args.data_path, "cifar/CIFAR-100-C/")
-        base_c_bar_path = os.path.join(args.data_path, "cifar/CIFAR-100-C-Bar/")
-        base_p_path = os.path.join(args.data_path, "cifar/CIFAR-100-P/")
+            args.data_path,
+            train=False,
+            transform=to_tensor_norm,
+            download=True)
+        paths = {
+            "c_path": os.path.join(args.data_path, "CIFAR-100-C/"),
+            "c_bar_path": os.path.join(args.data_path, "CIFAR-100-C-Bar/"),
+            "p_path": os.path.join(args.data_path, "CIFAR-100-P/"),
+        }
         num_classes = 100
 
     mixing_set_transforms = [
@@ -258,97 +376,9 @@ def main():
         optimizer.load_state_dict(checkpoint["optimizer"])
         print("Model restored from epoch:", start_epoch)
 
-    def run_full_evaluate(net):
-
-        net.eval()
-
-        evaluate_pgd = True
-        evaluate_rms = True
-        evaluate_c = True
-        evaluate_c_bar = True
-        evaluate_p = False
-        results = dict()
-
-        start = time.time()
-        # Evaluate clean accuracy first because test_c mutates underlying data
-        ctx = test(net, test_loader)
-        print(f"Clean \n\t Test Loss {ctx.loss:.3f} | Test Error {100 - 100. * ctx.acc:.2f}")
-
-        results["test_loss"] = ctx.loss
-        results["test_acc"] = ctx.acc
-        results["test_error"] = 100 - 100. * ctx.acc
-
-        if evaluate_rms:
-            rms = calib_err(ctx.confidence, ctx.correct, p="2")
-            aurra_value = aurra(ctx.confidence, ctx.correct)
-            print(f"Error: {100 - 100. * ctx.acc:.3f}")
-            print(f"RMS:   {100 * rms:.3f}")
-            print(f"AURRA: {100 * aurra_value:.3f}")
-            results["rms"] = rms
-            results["aurra"] = aurra_value
-
-        # test on adversarial data
-        if evaluate_pgd:
-            adversary = PGD(epsilon=2. / 255, num_steps=20, step_size=0.5 / 255).cuda()
-            adv_ctx = test(net, test_loader, adv=adversary)
-            print("Adversarial\n\tTest Loss {:.3f} | Test Error {:.2f}".format(
-                ctx.loss, 100 - 100. * adv_ctx.acc))
-            results["adv_test_loss"] = adv_ctx.loss
-            results["adv_test_acc"] = adv_ctx.acc
-            results["adv_test_error"] = 100 - 100. * adv_ctx.acc
-
-        # test on corrupted data
-        if evaluate_c:
-            if args.evaluate:
-                args.save = os.path.dirname(args.resume)
-
-            test_c_ctx = test_c(net, test_data, base_c_path,
-                                eval_batch_size=args.eval_batch_size, workers=args.num_workers, save_path=args.save)
-            print("Mean Corruption Error: {:.3f}".format(100 - 100. * test_c_ctx.acc))
-            results["c_acc"] = test_c_ctx.acc
-            results["c_error"] = 100 - 100. * test_c_ctx.acc
-            results["c_rms"] = test_c_ctx.rms
-
-        # test on c bar
-        if evaluate_c_bar:
-            test_c_bar_ctx = test_c(net, test_data, base_c_bar_path,
-                                    eval_batch_size=args.eval_batch_size, workers=args.num_workers, save_path=args.save)
-            print("Mean C-Bar Corruption Error: {:.3f}\n".format(100 - 100. * test_c_bar_ctx.acc))
-            results["c_bar_acc"] = test_c_bar_ctx.acc
-            results["c_bar_error"] = 100 - 100. * test_c_bar_ctx.acc
-            results["c_bar_rms"] = test_c_bar_ctx.rms
-            if evaluate_c:
-                print(
-                    f"average mCE of C and C_bar: {100 - 100. * (15 * test_c_ctx.acc + 10 * test_c_bar_ctx.acc) / 25:.3f}")
-                results["mce_c_and_c_bar"] = 100 - 100. * (15 * test_c_ctx.acc + 10 * test_c_bar_ctx.acc) / 25
-
-        # test on perturbed data
-        if evaluate_p:
-            flip_list, top5_list = test_p(net=net, path=base_p_path, num_classes=num_classes,
-                                          save_path=os.path.join(args.save, "perturbation_results.csv"))
-            print(f"Mean Flipping Prob\t{np.mean(flip_list):.5f}")
-            print(f"Mean Top-5 Distance\t{np.mean(top5_list):.5f}")
-            results["mean_flipping_prob"] = np.mean(flip_list)
-            results["mean_top5_distance"] = np.mean(top5_list)
-
-        results["seed"] = SEED
-        write_to_json(results, os.path.join(args.save, f"all_results.json"))
-
-        end = time.time() - start
-        print(f"evaluation finished in {end / 60:.2f} minutes.")
-        return
-
     if args.evaluate:
-        run_full_evaluate(net)
+        run_full_evaluate(net, test_loader, test_data, paths, num_classes=NUM_CLASSES, seed=SEED)
         return
-
-    def get_lr(step, total_steps, lr_max, lr_min, warmup_steps):
-        """Compute learning rate with linear warmup and cosine annealing."""
-        if step < warmup_steps:  # Linear warmup
-            return lr_min + (lr_max - lr_min) * (step / warmup_steps)
-        else:  # Cosine annealing
-            return lr_min + (lr_max - lr_min) * 0.5 * (
-                    1 + np.cos((step - warmup_steps) / (total_steps - warmup_steps) * np.pi))
 
     net = torch.compile(net)
     scheduler = torch.optim.lr_scheduler.LambdaLR(
@@ -418,7 +448,7 @@ def main():
     best_path = torch.load(os.path.join(args.save, "model_best.pth.tar"), map_location="cuda")
     print(f"evaluating the best model {best_path['epoch'] + 1}")
     net._orig_mod.load_state_dict(best_path["state_dict"])
-    run_full_evaluate(net)
+    run_full_evaluate(net, test_loader, test_data, paths, num_classes=NUM_CLASSES, seed=SEED)
 
 
 if __name__ == "__main__":
